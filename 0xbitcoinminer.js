@@ -1,301 +1,161 @@
-
 var web3utils =  require('web3-utils');
-
 var solidityHelper = require('./solidity-helper')
-
 var leftpad =  require('leftpad');
-
-
 
 const BN = require('bn.js');
 
 var tokenContractJSON = require('./contracts/_0xBitcoinToken.json');
 
+var cpuminer = require('./cpuminer/build/Release/cpuminer');
 
 var tokenContract;
 
+const PRINT_STATS_TIMEOUT = 60000;
 
+// Warning: safe timeout for a local node ONLY
+const COLLECT_CONTRACT_DATA_TIMEOUT = 100;
 
 
 module.exports =  {
 
-
-
-    async init(web3,  vault, miningLogger)
+    async init(web3, subsystem_command, vault, networkInterface, miningLogger)
     {
 
-      tokenContract =  new web3.eth.Contract(tokenContractJSON.abi,vault.getTokenContractAddress())
+      process.on('exit', () => {
+        console.log("Process exiting... stopping miner");
+        cpuminer.stop();
+      });
 
-      this.web3 = web3;
+      tokenContract =  new web3.eth.Contract(tokenContractJSON.abi,vault.getTokenContractAddress());
 
       this.miningLogger = miningLogger;
+      this.networkInterface = networkInterface;
+      this.vault = vault;
 
-      this.vault=vault;
+      var eth_account  = vault.getAccount();
+      console.log('Selected mining account:', eth_account);
 
-
-      this.eth_account  = vault.getAccount();
-
-
-      if( this.eth_account ==  null || this.eth_account.address == null )
+      if (eth_account ==  null || eth_account.address == null)
       {
         console.log("Please create a new account with 'account new' before mining.")
         return false;
       }
 
+      this.mining = true; // to prevent start of mining before end of func
+      var self = this;
+      var minerEthAddress = eth_account.address;
 
-    },
+      let contractData = {}; //passed around as a reference and edited globally
 
-
-
-
-  setNetworkInterface(netInterface)
-  {
-      this.networkInterface = netInterface;
-  },
-
-  setMiningStyle(style)
-  {
-      this.miningStyle = style;
-  },
-
-  async mine(subsystem_command,subsystem_option){
-
-
-      if( this.miningStyle == "pool" ){
-        if( subsystem_command != "mine" ){
-          return;
+      this.mineStuff = function(contractData) {
+        if (!this.mining) {
+          this.mineCoins(web3, contractData, minerEthAddress);
         }
       }
 
-      console.log('\n' )
-      console.log('Selected mining account:', this.eth_account )
-      console.log('\n' )
+      await self.collectDataFromContract(contractData);
 
+      setInterval(() => {self.collectDataFromContract(contractData)}, COLLECT_CONTRACT_DATA_TIMEOUT);
 
-      this.mining=true;
-      this.triesThisCycle = 0;
+      this.miningLogger.appendToStandardLog("Begin mining for " + minerEthAddress + " @ gasprice " + vault.getGasPriceGwei());
 
+      console.log("Mining for  "+ minerEthAddress);
+      console.log("Gas price is "+ vault.getGasPriceGwei() + ' gwei');
+      // console.log("Configured CPU threadcount is "+ vault.getNumThreads() )
 
-      var minerEthAddress = this.eth_account.address;
+      setInterval(() => { self.printMiningStats() }, PRINT_STATS_TIMEOUT);
 
-
-      setInterval(function(){ this.printMiningStats()}.bind(this), 5000)
-
-
-
-        var index = 0;
-
-        var self = this;
-
-
-
-        var ethAddress;
-
-
-        let miningParameters = {}; //passed around as a reference and edited globally
-
-        setInterval(function(){self.collectMiningParameters(minerEthAddress,miningParameters,self.miningStyle)},2000);
-
-        await self.collectMiningParameters(minerEthAddress, miningParameters,self.miningStyle);
-
-       function mineCycle(miningParameters){
-         //console.log('mine stuff')
-
-
-            if( self.mining){
-
-              var addressFrom;
-
-              if( self.miningStyle == "pool" ){
-                  addressFrom = miningParameters.poolEthAddress;
-              }else{
-                  addressFrom = minerEthAddress;
-              }
-
-
-              self.mineCoins(this.web3, miningParameters, minerEthAddress , addressFrom)
-              self.triesThisCycle+=1;
-
-              index++;
-              setTimeout(function(){mineCycle(miningParameters)},0)
-            }
-        }
-
-        this.miningLogger.appendToStandardLog("Begin mining for " + minerEthAddress + " gasprice " + this.vault.getGasPriceGwei() + " threads " + this.vault.getNumThreads())
-
-
-        setInterval(function(){
-        console.log("Mining for  "+ minerEthAddress)
-        console.log("Gas price is "+ self.vault.getGasPriceGwei() + ' gwei')
-        console.log("Configured CPU threadcount is "+ self.vault.getNumThreads() )
-        console.log("Mining Difficulty  "+ miningParameters.miningDifficulty)
-        console.log("Difficulty Target  "+ miningParameters.miningTarget)
-      },10000)
-
-        var threads = this.vault.getNumThreads();
-
-        for(var i=0;i<threads;i++)
-        {
-          mineCycle( miningParameters );
-        }
-
-
-
-
+      // let's mine!
+      this.mining = false;
+      this.mineStuff(contractData);
     },
 
-    async collectMiningParameters(minerEthAddress,miningParameters,miningStyle)
+    async collectDataFromContract(contractData)
     {
+      try {
+        const miningDifficultyString = await tokenContract.methods.getMiningDifficulty().call();
+        const miningDifficulty = parseInt(miningDifficultyString);
 
-      if(miningStyle === "pool")
-      {
+        const miningTargetString = await tokenContract.methods.getMiningTarget().call();
+        const miningTarget = web3utils.toBN(miningTargetString)
 
-        var parameters = await this.networkInterface.collectMiningParameters(minerEthAddress);
+        const challengeNumber = await tokenContract.methods.getChallengeNumber().call();
 
+        let bResume = false;
 
-      }else{
+        if (!contractData.challengeNumber || contractData.challengeNumber != challengeNumber) {
+          console.log("New challenge number: " + challengeNumber);
+          cpuminer.setChallengeNumber(challengeNumber);
+          bResume = true;
+        }
+        if (!contractData.miningTarget || contractData.miningTarget.cmp(miningTarget) != 0) {
+          console.log("New mining target: 0x" + miningTarget.toString(16));
+          cpuminer.setDifficultyTarget("0x" + miningTarget.toString(16));
+        }
+        if (!contractData.miningDifficulty || contractData.miningDifficulty != miningDifficulty) {
+          console.log("New difficulty: " + miningDifficulty);
+        }
 
-        var parameters = await this.networkInterface.collectMiningParameters();
+        contractData.challengeNumber = challengeNumber;
+        contractData.miningTarget = miningTarget;
+        contractData.miningDifficulty = miningDifficulty;
 
+        if (bResume && !this.mining) {
+          console.log("Resuming mining operations with new challenge");
+          this.mineStuff(contractData);
+        }
+
+      } catch (e) {
+        console.error("cannot retrieve contract info", e);
       }
-
-      //console.log('collected mining params ', parameters)
-      miningParameters.miningDifficulty = parameters.miningDifficulty;
-      miningParameters.challengeNumber = parameters.challengeNumber;
-      miningParameters.miningTarget = parameters.miningTarget;
-      miningParameters.poolEthAddress = parameters.poolEthAddress;
-
-
+      return contractData;
     },
 
-    async submitNewMinedBlock( addressFrom, minerEthAddress, solution_number,digest_bytes,challenge_number, target, difficulty)
+    async submitNewMinedBlock(addressFrom, solution_number, digest_bytes, challenge_number)
     {
-       this.miningLogger.appendToStandardLog("Giving mined solution to network interface " + challenge_number)
+       this.miningLogger.appendToStandardLog("Giving mined solution to network interface " + challenge_number);
 
-       this.networkInterface.queueMiningSolution( addressFrom, minerEthAddress, solution_number , digest_bytes , challenge_number, target, difficulty)
+       this.networkInterface.queueMiningSolution(addressFrom, solution_number , digest_bytes , challenge_number)
     },
 
-
-
-    /*
-    The challenge word will be...
-
-    //we have to find the latest mining hash by asking the contract
-
-    sha3( challenge_number , minerEthAddress , solution_number )
-
-
-    */
-    mineCoins(web3, miningParameters , minerEthAddress, addressFrom)
+    mineCoins(web3, contractData , minerEthAddress)
     {
+      cpuminer.setMinerAddress(minerEthAddress);
 
+      var self = this;
 
-               var solution_number = web3utils.randomHex(32)  //solution_number like bitcoin
-
-               var challenge_number = miningParameters.challengeNumber;
-               var target = miningParameters.miningTarget;
-               var difficulty = miningParameters.miningDifficulty;
-
-               var digest =  web3utils.soliditySha3( challenge_number , addressFrom, solution_number )
-
-
-              //  console.log(web3utils.hexToBytes('0x0'))
-               var digestBytes32 = web3utils.hexToBytes(digest)
-               var digestBigNumber = web3utils.toBN(digest)
-
-               var miningTarget = web3utils.toBN(target) ;
-
-
-
-                //console.log('digestBigNumber',digestBigNumber.toString())
-                 //console.log('miningTarget',miningTarget.toString())
-
-               if ( digestBigNumber.lt(miningTarget)  )
-               {
-
-                  if(this.testMode){
-                    console.log(minerEthAddress)
-                    console.log('------')
-                    console.log(solution_number)
-                    console.log(challenge_number)
-                    console.log(solution_number)
-                    console.log('------')
-                    console.log( web3utils.bytesToHex(digestBytes32))
-
-                 //pass in digest bytes or trimmed ?
-
-
-                   this.mining = false;
-
-                   /*this.networkInterface.checkMiningSolution( minerEthAddress, solution_number , web3utils.bytesToHex( digestBytes32 ),challenge_number,miningTarget,
-                     function(result){
-                      console.log('checked mining soln:' ,result)
-                    })*/
-
-
-                  }else {
-                    console.log('submit mined solution with challenge ', challenge_number)
-
-                    this.submitNewMinedBlock( addressFrom, minerEthAddress, solution_number,   web3utils.bytesToHex( digestBytes32 ) , challenge_number, target, difficulty );
-                  }
-               }
-
-
-    },
-
-    countZeroBytesInFront(array)
-    {
-      var zero_char_code = '30'
-
-      var char;
-      var count = 0;
-      var length = array.length;
-
-      for(var i=0;i<array.length;i+=1)
-      {
-        if(array[i] === 0)
-        {
-          count++;
-        }else{
-          break
+      const verifyAndSubmit = (solution_number) => {
+        const challenge_number = contractData.challengeNumber;
+        const digest = web3utils.sha3(challenge_number + minerEthAddress.substring(2) + solution_number.substring(2));
+        const digestBigNumber = web3utils.toBN(digest);
+        if (digestBigNumber.lte(contractData.miningTarget)) {
+          console.log('Submit mined solution for challenge ', challenge_number);
+          self.submitNewMinedBlock(minerEthAddress, solution_number, digest, challenge_number);
+        } else {
+          console.error("Verification failed!\n",
+            "challenge: ", challenge_number, "\n",
+            "address: ", minerEthAddress, "\n",
+            "solution: ", solution_number, "\n",
+            "digest: ", digestBigNumber, "\n",
+            "target: ", contractData.miningTarget);
         }
       }
 
-      return count;
-
-    },
-
-    countZeroCharactersInFront(s)
-    {
-      var zero_char_code = '30'
-
-      var char;
-      var count = 0;
-      var length = s.length;
-
-      for(var i=0;i<s.length;i+=2)
-      {
-        if(s.substring(i,i+2) === zero_char_code)
-        {
-          count++;
-        }else{
-          break
+      self.mining = true;
+      cpuminer.run( (err, sol) => {
+        if (sol) {
+          console.log("Solution found!");
+          verifyAndSubmit(sol);
         }
-      }
-
-      return count;
-
+        console.log("Stopping mining operations for the moment...");
+        self.mining = false;
+      });
     },
 
-
-    getRandomInt(max) {
-      return Math.floor(Math.random() * Math.floor(max));
-    },
 
     printMiningStats()
     {
-      console.log('Hash rate:',  this.triesThisCycle / 5);
-      this.triesThisCycle = 0;
+      console.log('Hash rate: ' + parseInt(cpuminer.hashes() / PRINT_STATS_TIMEOUT) + " kH/s");
     }
 
 
