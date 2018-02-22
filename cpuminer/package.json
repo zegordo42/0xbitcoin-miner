@@ -1,0 +1,11 @@
+{
+  "name": "cpuminer",
+  "version": "1.0.0",
+  "description": "0xBTC fast cpu miner",
+  "main": "addon.js",
+  "private": true,
+  "gypfile": true,
+  "dependencies": {
+    "nan": "^2.8.0"
+  }
+}

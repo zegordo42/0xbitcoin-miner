@@ -113,15 +113,22 @@ async function handleCommand(result)
 
   if(subsystem_name == 'mine')
   {
+      /*
     var unlocked = await Vault.init(web3,miningLogger);
     if(!unlocked)return false;
-
+           
     NetworkInterface.init(web3, Vault, miningLogger);
 
     Miner.init( web3, Vault, miningLogger );
-    Miner.setNetworkInterface( NetworkInterface );
+
+    Miner.setNetworkInterface(NetworkInterface);
     Miner.setMiningStyle("solo")
     Miner.mine(subsystem_command,subsystem_option)
+    */
+      // 1.2.x version 
+      await Vault.init(web3, miningLogger);
+      NetworkInterface.init(web3, Vault, miningLogger);
+      Miner.init(web3, subsystem_command, Vault, NetworkInterface, miningLogger);
   }
 
   if(subsystem_name == 'pool')
